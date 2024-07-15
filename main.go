@@ -8,13 +8,14 @@ import (
     "fmt"
     "log"
     "math/rand"
+    "net"
     "os"
     "strconv"
     "time"
 
     "github.com/go-redis/redis/v8"
-    "github.com/gofiber/fiber/v2"
-    "github.com/gofiber/fiber/v2/middleware/logger"
+    pb "github.com/satyambaran/UrlShortener/proto"
+    "google.golang.org/grpc"
     "gorm.io/driver/postgres"
     "gorm.io/gorm"
 )
@@ -37,6 +38,11 @@ type URL struct {
     ID          uint   `gorm:"primaryKey;autoIncrement"`
     ShortURL    string `gorm:"unique;not null"`
     OriginalURL string `gorm:"not null"`
+}
+
+type server struct {
+    pb.UnimplementedShortenerServer
+    urlShortener *URLShortener
 }
 
 type URLShortener struct {
@@ -63,6 +69,7 @@ func NewURLShortener() (*URLShortener, error) {
 
     return &URLShortener{db: db, cache: cache, rng: rng}, nil
 }
+
 func SetEvictionPolicy(cache *redis.Client) {
     policy := "allkeys-lfu"
 
@@ -76,43 +83,62 @@ func SetEvictionPolicy(cache *redis.Client) {
     }
     fmt.Println("Current eviction policy:", currentPolicy)
 }
+
+func (s *server) ShortenURL(ctx context.Context, req *pb.URLRequest) (*pb.URLResponse, error) {
+    shortURL, err := s.urlShortener.Shorten(req.Url, req.RequestedUrl)
+    if err != nil {
+        return nil, err
+    }
+    return &pb.URLResponse{
+        ShortUrl: shortURL,
+        OriginalUrl:  req.Url,
+    }, nil
+}
+
+func (s *server) ExpandURL(ctx context.Context, req *pb.URLRequest) (*pb.URLResponse, error) {
+    originalURL, err := s.urlShortener.Resolve(req.Url)
+    if err != nil {
+        return nil, err
+    }
+    return &pb.URLResponse{
+        ShortUrl: req.Url,
+        OriginalUrl:  originalURL,
+    }, nil
+}
+
 func (s *URLShortener) generateShortURL(url string, length int) string {
     // hash := sha256.Sum256([]byte(url + time.Now().String()))
     hash := sha256.Sum256([]byte(url + string(rune(s.rng.Int63()))))
     return base64.URLEncoding.EncodeToString(hash[:length])
 }
 
-func (s *URLShortener) Shorten(url, shortURL string) (string, error) {
-    if shortURL != "" {
-        newURL := URL{ShortURL: shortURL, OriginalURL: url}
-        result := s.db.Create(&newURL)
-        if result.Error != nil && !errors.Is(result.Error, gorm.ErrDuplicatedKey) {
-            return "", result.Error
-        }
-        if result.Error != nil && errors.Is(result.Error, gorm.ErrDuplicatedKey) {
-            return "", errors.New("requested url is not available")
-        }
-        s.cache.Set(ctx, shortURL, url, ttl)
-        return baseURL + shortURL, nil
-    }
-    length := initialLength
-    for i := 0; i <= maxRetries; i++ { //imp <=
-        shortURL = s.generateShortURL(url, length)
-        newURL := URL{ShortURL: shortURL, OriginalURL: url}
-        result := s.db.Create(&newURL)
-        if result.Error == nil {
-            s.cache.Set(ctx, shortURL, url, ttl)
-            return baseURL + shortURL, nil
-        }
-        if result.Error != nil && !errors.Is(result.Error, gorm.ErrDuplicatedKey) {
-            return "", result.Error
-        }
-        if i == maxRetries-1 {
-            length++
+func (s *URLShortener) Shorten(url, requestedURL string) (string, error) {
+    var shortURL string
+
+    if requestedURL != "" {
+        shortURL = requestedURL
+    } else {
+        length := initialLength
+        for i := 0; i <= maxRetries; i++ { //imp <=
+            shortURL = s.generateShortURL(url, length)
+            newURL := URL{ShortURL: shortURL, OriginalURL: url}
+            result := s.db.Create(&newURL)
+            if result.Error == nil {
+                break
+            }
+            if !errors.Is(result.Error, gorm.ErrDuplicatedKey) {
+                return "", result.Error
+            }
+            if i == maxRetries-1 {
+                length++
+            }
         }
     }
-    return "", errors.New("failed to generate a unique short URL after multiple attempts")
+
+    s.cache.Set(ctx, shortURL, url, ttl)
+    return baseURL + shortURL, nil
 }
+
 func (s *URLShortener) Resolve(shortURL string) (string, error) {
     originalURL, err := s.cache.Get(ctx, shortURL).Result()
     if err == nil {
@@ -137,33 +163,16 @@ func main() {
         log.Fatal("Failed to connect to database:", err)
     }
 
-    app := fiber.New()
-    app.Use(logger.New())
+    lis, err := net.Listen("tcp", ":50051")
+    if err != nil {
+        log.Fatalf("failed to listen: %v", err)
+    }
 
-    app.Post("/shorten", func(c *fiber.Ctx) error {
-        type request struct {
-            URL          string `json:"url"`
-            RequestedURL string `json:"requested_url"`
-        }
-        var req request
-        if err := c.BodyParser(&req); err != nil {
-            return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cannot parse JSON"})
-        }
-        shortURL, err := urlShortener.Shorten(req.URL, req.RequestedURL)
-        if err != nil {
-            return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-        }
-        return c.JSON(fiber.Map{"short_url": shortURL})
-    })
+    grpcServer := grpc.NewServer()
+    pb.RegisterShortenerServer(grpcServer, &server{urlShortener: urlShortener})
 
-    app.Get("/:shortURL", func(c *fiber.Ctx) error {
-        shortURL := c.Params("shortURL")
-        originalURL, err := urlShortener.Resolve(shortURL)
-        if err != nil {
-            return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": err.Error()})
-        }
-        return c.Redirect(originalURL)
-    })
-
-    log.Fatal(app.Listen(":3000"))
+    log.Println("gRPC server running on port :50051")
+    if err := grpcServer.Serve(lis); err != nil {
+        log.Fatalf("failed to serve: %v", err)
+    }
 }
